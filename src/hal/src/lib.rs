@@ -271,11 +271,53 @@ bitflags! {
         // Bits for Extensions
 
         /// Supports task shader stage.
-        const TASK_SHADER = 0x0000_0001 << 96;
+        const TASK_SHADER = 0x0001 << 96;
         /// Supports mesh shader stage.
-        const MESH_SHADER = 0x0000_0002 << 96;
+        const MESH_SHADER = 0x0002 << 96;
         /// Mask for all the features associated with mesh shader stages.
         const MESH_SHADER_MASK = Features::TASK_SHADER.bits | Features::MESH_SHADER.bits;
+
+        // Bits for downlevel hardware and apis
+
+        /// Supports compute shaders
+        const COMPUTE_SHADER = 0x0001 << 112;
+        /// Supports FL5 compute shaders
+        const COMPUTE_SHADER_FL5 = 0x0002 << 112;
+        /// Supports storage images
+        const STORAGE_IMAGE = 0x0004 << 112;
+        /// Supports read only depth stencil
+        const READ_ONLY_DEPTH_STENCIL = 0x0008 << 112;
+        /// Supports DX11 image and buffer copies that need compute shaders.
+        ///
+        /// Image -> Image:
+        /// R8G8 to R16
+        /// R16 to R8G8
+        /// R8G8B8A8 to R32
+        /// R8G8B8A8 to R16G16
+        /// R16G16 to R32
+        /// R16G16 to R8G8B8A8
+        /// R32 to R16G16
+        /// R32 to R8G8B8A8
+        ///
+        /// Buffer -> Image
+        /// R32
+        /// R32G32
+        /// R32G32B32A32
+        /// R16
+        /// R16G16
+        /// R16G16B16A16
+        /// R8
+        /// R8G8
+        /// R8G8B8A8_UINT
+        /// R8G8B8A8_UNORM
+        ///
+        /// Image -> Buffer
+        /// All copies
+        const DX11_COMPUTE_COPIES = 0x0010 << 112;
+        /// Allowed to make textures which are non power of two
+        const NON_POWER_OF_TWO_TEXTURES = 0x0020 << 112;
+        /// Mask for all the features that are downlevel.
+        const DOWNLEVEL_MASK = 0xFFFF << 112;
     }
 }
 

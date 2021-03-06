@@ -143,8 +143,22 @@ impl Instance {
     }
 }
 
+unsafe fn check_feature_support<T>(
+    device: &d3d11::ID3D11Device,
+    feature: d3d11::D3D11_FEATURE,
+) -> T {
+    let mut value = mem::zeroed::<T>();
+    let ret = device.CheckFeatureSupport(
+        feature,
+        &mut value as *mut _ as *mut _,
+        mem::size_of::<T>() as _,
+    );
+    assert_eq!(ret, winerror::S_OK);
+    value
+}
+
 fn get_features(
-    _device: ComPtr<d3d11::ID3D11Device>,
+    device: ComPtr<d3d11::ID3D11Device>,
     feature_level: d3dcommon::D3D_FEATURE_LEVEL,
 ) -> hal::Features {
     let mut features = hal::Features::empty()
@@ -157,6 +171,30 @@ fn get_features(
         | hal::Features::SAMPLER_ANISOTROPY
         | hal::Features::DEPTH_CLAMP
         | hal::Features::NDC_Y_UP;
+
+    if d3dcommon::D3D_FEATURE_LEVEL_9_1 <= feature_level
+        && feature_level < d3dcommon::D3D_FEATURE_LEVEL_9_3
+    {
+        let d3d9_features: d3d11::D3D11_FEATURE_DATA_D3D9_OPTIONS  = unsafe {
+            check_feature_support(&device, d3d11::D3D11_FEATURE_D3D9_OPTIONS)
+        };
+        features.set(
+            hal::Features::NON_POWER_OF_TWO_TEXTURES,
+            d3d9_features.FullNonPow2TextureSupport != 0,
+        );
+    }
+
+    if d3dcommon::D3D_FEATURE_LEVEL_10_0 <= feature_level
+        && feature_level < d3dcommon::D3D_FEATURE_LEVEL_11_0
+    {
+        let compute_support: d3d11::D3D11_FEATURE_DATA_D3D10_X_HARDWARE_OPTIONS = unsafe {
+            check_feature_support(&device, d3d11::D3D11_FEATURE_D3D10_X_HARDWARE_OPTIONS)
+        };
+        features.set(
+            hal::Features::COMPUTE_SHADER,
+            compute_support.ComputeShaders_Plus_RawAndStructuredBuffers_Via_Shader_4_x != 0,
+        );
+    }
 
     features.set(
         hal::Features::TEXTURE_DESCRIPTOR_ARRAY
@@ -175,7 +213,13 @@ fn get_features(
             | hal::Features::FRAGMENT_STORES_AND_ATOMICS
             | hal::Features::FORMAT_BC
             | hal::Features::TESSELLATION_SHADER
-            | hal::Features::DRAW_INDIRECT_FIRST_INSTANCE,
+            | hal::Features::DRAW_INDIRECT_FIRST_INSTANCE
+            // Downlevel
+            | hal::Features::COMPUTE_SHADER
+            | hal::Features::COMPUTE_SHADER_FL5
+            | hal::Features::STORAGE_IMAGE
+            | hal::Features::READ_ONLY_DEPTH_STENCIL
+            | hal::Features::DX11_COMPUTE_COPIES,
         feature_level >= d3dcommon::D3D_FEATURE_LEVEL_11_0,
     );
 
@@ -306,7 +350,7 @@ fn get_limits(feature_level: d3dcommon::D3D_FEATURE_LEVEL) -> hal::Limits {
         max_color_attachments,
         buffer_image_granularity: 1,
         non_coherent_atom_size: 1, // TODO
-        max_sampler_anisotropy: 16.,
+        max_sampler_anisotropy: 16.0,
         optimal_buffer_copy_offset_alignment: 1, // TODO
         // buffer -> image and image -> buffer paths use compute shaders that, at maximum, read 4 pixels from the buffer
         // at a time, so need an alignment of at least 4.
@@ -676,7 +720,7 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
         let func: libloading::Symbol<CreateFun> =
             self.library_d3d11.get(b"D3D11CreateDevice").unwrap();
 
-        let (device, cxt) = {
+        let (device, cxt, feature_level) = {
             if !self.features().contains(requested_features) {
                 return Err(hal::device::CreationError::MissingFeature);
             }
@@ -744,7 +788,11 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
                 feature_level >> 8 & 0xF
             );
 
-            (ComPtr::from_raw(device), ComPtr::from_raw(cxt))
+            (
+                ComPtr::from_raw(device),
+                ComPtr::from_raw(cxt),
+                feature_level,
+            )
         };
 
         let device1 = device.cast::<d3d11_1::ID3D11Device1>().ok();
@@ -755,6 +803,7 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
             cxt,
             requested_features,
             self.memory_properties.clone(),
+            feature_level,
         );
 
         // TODO: deferred context => 1 cxt/queue?
@@ -1093,7 +1142,11 @@ impl window::PresentationSurface<Backend> for Surface {
                     render_target_views: Vec::new(),
                     debug_name: None,
                 },
-                bind: conv::map_image_usage(config.image_usage, config.format.surface_desc()),
+                bind: conv::map_image_usage(
+                    config.image_usage,
+                    config.format.surface_desc(),
+                    device.internal.device_feature_level,
+                ),
                 requirements: memory::Requirements {
                     size: 0,
                     alignment: 1,
@@ -1299,9 +1352,7 @@ impl RenderPassCache {
                 let attachment = &self.attachments[id].view;
                 let ds_view = attachment.dsv_handle.unwrap();
 
-                let rods_view = attachment.rodsv_handle.unwrap();
-
-                (Some(ds_view), Some(rods_view))
+                (Some(ds_view), attachment.rodsv_handle)
             }
             None => (None, None),
         };
@@ -1956,7 +2007,7 @@ unsafe impl Sync for CommandBuffer {}
 
 impl CommandBuffer {
     fn create_deferred(
-        device: &d3d11::ID3D11Device,
+        device: ComPtr<d3d11::ID3D11Device>,
         device1: Option<&d3d11_1::ID3D11Device1>,
         internal: Arc<internal::Internal>,
     ) -> Self {
@@ -2399,13 +2450,21 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
         let _scope = debug_scope!(&self.context, "BindGraphicsDescriptorSets");
 
         // TODO: find a better solution to invalidating old bindings..
-        let nulls = [ptr::null_mut(); d3d11::D3D11_PS_CS_UAV_REGISTER_COUNT as usize];
-        self.context.CSSetUnorderedAccessViews(
-            0,
-            d3d11::D3D11_PS_CS_UAV_REGISTER_COUNT,
-            nulls.as_ptr(),
-            ptr::null_mut(),
-        );
+        if self
+            .internal
+            .device_features
+            .intersects(hal::Features::COMPUTE_SHADER)
+        {
+            let cs_uavs = if self.internal.device_feature_level <= d3dcommon::D3D_FEATURE_LEVEL_11_0
+            {
+                1
+            } else {
+                d3d11::D3D11_PS_CS_UAV_REGISTER_COUNT
+            };
+            let nulls = [ptr::null_mut(); d3d11::D3D11_PS_CS_UAV_REGISTER_COUNT as usize];
+            self.context
+                .CSSetUnorderedAccessViews(0, cs_uavs, nulls.as_ptr(), ptr::null_mut());
+        }
 
         let mut offset_iter = offsets;
 
@@ -2745,7 +2804,8 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
             panic!("fill_buffer failed to make UAV failed: 0x{:x}", hr);
         }
 
-        self.context.ClearUnorderedAccessViewUint(uav.as_raw(), &[data; 4]);
+        self.context
+            .ClearUnorderedAccessViewUint(uav.as_raw(), &[data; 4]);
     }
 
     unsafe fn update_buffer(&mut self, _buffer: &Buffer, _offset: buffer::Offset, _data: &[u8]) {
@@ -3346,7 +3406,7 @@ impl hal::pool::CommandPool<Backend> for CommandPool {
 
     unsafe fn allocate_one(&mut self, _level: command::Level) -> CommandBuffer {
         CommandBuffer::create_deferred(
-            &self.device,
+            self.device.clone(),
             self.device1.as_deref(),
             Arc::clone(&self.internal),
         )

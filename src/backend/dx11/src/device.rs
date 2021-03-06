@@ -55,7 +55,7 @@ pub struct Device {
     pub(crate) context: ComPtr<d3d11::ID3D11DeviceContext>,
     features: hal::Features,
     memory_properties: MemoryProperties,
-    internal: Arc<internal::Internal>,
+    pub(crate) internal: Arc<internal::Internal>,
 }
 
 impl fmt::Debug for Device {
@@ -84,9 +84,10 @@ impl Device {
         context: ComPtr<d3d11::ID3D11DeviceContext>,
         features: hal::Features,
         memory_properties: MemoryProperties,
+        feature_level: u32,
     ) -> Self {
         Device {
-            internal: Arc::new(internal::Internal::new(&device)),
+            internal: Arc::new(internal::Internal::new(&device, features, feature_level)),
             raw: device,
             raw1: device1,
             context,
@@ -412,6 +413,7 @@ impl Device {
         source: &pso::EntryPoint<Backend>,
         layout: &PipelineLayout,
         features: &hal::Features,
+        device_feature_level: u32,
     ) -> Result<Option<ComPtr<d3dcommon::ID3DBlob>>, pso::CreationError> {
         // TODO: entrypoint stuff
         match *source.module {
@@ -420,7 +422,12 @@ impl Device {
                 Err(pso::CreationError::Other)
             }
             ShaderModule::Spirv(ref raw_data) => Ok(shader::compile_spirv_entrypoint(
-                raw_data, stage, source, layout, features,
+                raw_data,
+                stage,
+                source,
+                layout,
+                features,
+                device_feature_level,
             )?),
         }
     }
@@ -967,7 +974,13 @@ impl device::Device<Backend> for Device {
         let features = &self.features;
         let build_shader =
             |stage: ShaderStage, source: Option<&pso::EntryPoint<'a, Backend>>| match source {
-                Some(src) => Self::extract_entry_point(stage, src, desc.layout, features),
+                Some(src) => Self::extract_entry_point(
+                    stage,
+                    src,
+                    desc.layout,
+                    features,
+                    self.internal.device_feature_level,
+                ),
                 None => Ok(None),
             };
 
@@ -1075,7 +1088,13 @@ impl device::Device<Backend> for Device {
         let features = &self.features;
         let build_shader =
             |stage: ShaderStage, source: Option<&pso::EntryPoint<'a, Backend>>| match source {
-                Some(src) => Self::extract_entry_point(stage, src, desc.layout, features),
+                Some(src) => Self::extract_entry_point(
+                    stage,
+                    src,
+                    desc.layout,
+                    features,
+                    self.internal.device_feature_level,
+                ),
                 None => Ok(None),
             };
 
@@ -1395,7 +1414,7 @@ impl device::Device<Backend> for Device {
         let ext = kind.extent();
         let size = (ext.width * ext.height * ext.depth) as u64 * bytes_per_texel as u64;
 
-        let bind = conv::map_image_usage(usage, surface_desc);
+        let bind = conv::map_image_usage(usage, surface_desc, self.internal.device_feature_level);
         debug!("{:b}", bind);
 
         Ok(Image {
@@ -1573,7 +1592,11 @@ impl device::Device<Backend> for Device {
 
         let mut unordered_access_views = Vec::new();
 
-        if image.usage.contains(Usage::TRANSFER_DST) && !compressed && !depth {
+        if image.usage.contains(Usage::TRANSFER_DST)
+            && !compressed
+            && !depth
+            && self.features.intersects(hal::Features::STORAGE_IMAGE)
+        {
             for mip in 0..image.mip_levels {
                 let view = ViewInfo {
                     resource: resource,
@@ -1814,7 +1837,9 @@ impl device::Device<Backend> for Device {
             } else {
                 None
             },
-            rodsv_handle: if image.usage.contains(image::Usage::DEPTH_STENCIL_ATTACHMENT) {
+            rodsv_handle: if image.usage.contains(image::Usage::DEPTH_STENCIL_ATTACHMENT)
+                && self.features.intersects(hal::Features::READ_ONLY_DEPTH_STENCIL)
+            {
                 let rodsv =
                     self.view_image_as_depth_stencil(&info, Some(image.format.is_stencil()))?;
 
